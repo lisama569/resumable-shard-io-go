@@ -353,3 +353,76 @@ func TestPipeline_MixedSourcesInOneRun(t *testing.T) {
 		t.Fatal("mixed-source merge mismatch")
 	}
 }
+
+func TestPipeline_BudgetSmallerThanShardFailsFast(t *testing.T) {
+	data := bytes.Repeat([]byte("B"), 300)
+	s := &memSource{id: "s", kind: RandomAccess, data: data, conc: 4, gate: make(chan struct{})}
+	states := []SourceState{memState(s)}
+	shards, _ := PlanShards(states, 100) // 每片 100B
+	// 在途预算 50B < 单片 100B：即使没有任何在途分片也永远无法派发。
+	results := make(chan ShardResult, 16)
+	done := make(chan error, 1)
+	go func() {
+		done <- NewPipeline(PipelineConfig{GlobalWorkers: 4, InFlightBytes: 50}).
+			Run(context.Background(), map[string]Source{"s": s}, shards, nil, results)
+	}()
+	go func() {
+		for range results {
+		}
+	}()
+	select {
+	case err := <-done:
+		var e *Error
+		if !errors.As(err, &e) || e.Kind != KindBudgetTooSmall {
+			t.Fatalf("want KindBudgetTooSmall, got %#v", err)
+		}
+		if !errors.Is(err, ErrBudgetTooSmall) {
+			t.Fatalf("errors.Is ErrBudgetTooSmall failed: %#v", err)
+		}
+		if s.readsStarted.Load() != 0 {
+			t.Fatalf("no shard read may start when budget is too small, got %d", s.readsStarted.Load())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pipeline hung instead of failing on a sub-shard budget")
+	}
+	close(s.gate)
+}
+
+func TestPipeline_BudgetExactlyShardSizeStillCompletes(t *testing.T) {
+	data := bytes.Repeat([]byte("E"), 500)
+	s := &memSource{id: "s", kind: RandomAccess, data: data, conc: 1}
+	states := []SourceState{memState(s)}
+	shards, _ := PlanShards(states, 100) // 每片恰好 100B
+	// 预算恰为一片大小：一次一片串行也必须正常完成，结果不变。
+	got, err := runPipeline(t, PipelineConfig{GlobalWorkers: 1, InFlightBytes: 100},
+		map[string]Source{"s": s}, shards, nil)
+	if err != nil {
+		t.Fatalf("budget==shard size must complete: %v", err)
+	}
+	if len(got) != len(shards) {
+		t.Fatalf("got %d results want %d", len(got), len(shards))
+	}
+	var merged bytes.Buffer
+	for _, r := range got {
+		merged.Write(r.Data)
+	}
+	if !bytes.Equal(merged.Bytes(), data) {
+		t.Fatal("result under minimal budget differs from serial reference")
+	}
+}
+
+func TestPipeline_OneWorkerMinimalBudgetSequentialSource(t *testing.T) {
+	// 顺序源 + 单 worker + 预算恰为单片：最紧配置也要有限时间完成。
+	data := bytes.Repeat([]byte("Q"), 37*7)
+	s := &memSource{id: "seq", kind: Sequential, data: data, conc: 1}
+	states := []SourceState{memState(s)}
+	shards, _ := PlanShards(states, 37)
+	got, err := runPipeline(t, PipelineConfig{GlobalWorkers: 1, InFlightBytes: 37},
+		map[string]Source{"seq": s}, shards, nil)
+	if err != nil {
+		t.Fatalf("minimal sequential run: %v", err)
+	}
+	if len(got) != len(shards) {
+		t.Fatalf("got %d shards want %d", len(got), len(shards))
+	}
+}

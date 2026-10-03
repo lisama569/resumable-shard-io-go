@@ -45,6 +45,10 @@ type Task struct {
 	shards  []Shard
 	cp      *Checkpoint
 	out     *os.File
+	// changedSources：修复模式下被确认内容变化（同大小）的来源；
+	// 最终校验时对这些来源不再要求收尾指纹等于检查点指纹（它们本就被允许变化，
+	// 且检查点指纹已更新为当前值），但仍要求读取全程不再变化、大小保持稳定。
+	changedSources map[string]bool
 }
 
 // NewTask 创建任务（暂不触碰文件系统）。
@@ -513,6 +517,122 @@ func writeFullAt(ctx context.Context, f *os.File, buf []byte, off int64) error {
 		}
 	}
 	return nil
+}
+
+// executeRecoverRun 执行修复后的“补齐”运行：
+// 打开来源 → 打开/创建输出 → 跳过严格指纹匹配（影响范围已界定）→ 复用未失效分片 →
+// 流水线只重做失效分片 → 最终串行等价校验。
+func (t *Task) executeRecoverRun(ctx context.Context, cp *Checkpoint) (retErr error) {
+	if err := t.openSources(ctx); err != nil {
+		return err
+	}
+	defer t.closeSources()
+
+	// 输出以可读写方式打开，不存在则创建（断电后输出文件可能整体丢失）。
+	out, err := os.OpenFile(t.cfg.OutputPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		if os.IsPermission(err) {
+			return newError(KindPermission, "", "output open not permitted: "+t.cfg.OutputPath, err)
+		}
+		return newError(KindSourceUnreadable, "", "output open failed: "+t.cfg.OutputPath, err)
+	}
+	t.out = out
+	defer func() { _ = out.Close() }()
+
+	t.cp = cp
+	// 修复模式下来源指纹允许不同于检查点（同大小内容改写）；
+	// openSources 得到的是“当前”来源状态与当前大小对应的分片计划。
+	// 这里强制以检查点冻结的计划为准（同大小保证计划完全相同）。
+	t.shards, err = planFromCheckpoint(cp)
+	if err != nil {
+		return err
+	}
+	if err := validateCompletedAgainstPlan(cp, t.shards); err != nil {
+		return err
+	}
+
+	// 顺序源游标推进到仍被复用的连续前缀末尾。
+	if err := t.resumeSequentialCursors(cp); err != nil {
+		return err
+	}
+
+	if len(cp.Completed) < len(t.shards) {
+		if err := t.executePipeline(ctx, cp, true); err != nil {
+			return err
+		}
+	}
+
+	finalHash, err := t.finalVerifyRelaxed(ctx, cp)
+	if err != nil {
+		return err
+	}
+	cp.FinalHash = finalHash
+	if err := cp.Save(t.cfg.CheckpointPath); err != nil {
+		return err
+	}
+	t.log.InfoContext(ctx, "repair completed",
+		slog.String("task", t.cfg.TaskID),
+		slog.Int("shards", len(t.shards)),
+		slog.String("final_sha256", cp.FinalHash),
+		slog.String("basis", "damaged parts redone; reused parts verified; serial-equivalent merge verified"))
+	return nil
+}
+
+// finalVerifyRelaxed 与 finalVerify 相同，但在修复模式下放宽来源指纹收尾要求：
+//   - 普通来源：收尾指纹必须等于当前开始时指纹（读取全程未再变化）；
+//   - 被允许同大小变化的来源：只要求大小不变（分片边界稳定），不比对哈希/mtime。
+func (t *Task) finalVerifyRelaxed(ctx context.Context, cp *Checkpoint) (string, error) {
+	info, err := t.out.Stat()
+	if err != nil {
+		return "", newError(KindSourceUnreadable, "", "stat output failed in final verify", err)
+	}
+	var wantSize int64
+	for _, sh := range t.shards {
+		wantSize += sh.Length()
+	}
+	if info.Size() != wantSize {
+		return "", newError(KindChecksumMismatch, "",
+			fmt.Sprintf("output size %d != planned serial-equivalent size %d", info.Size(), wantSize),
+			ErrChecksumMismatch)
+	}
+	if _, err := t.out.Seek(0, io.SeekStart); err != nil {
+		return "", newError(KindSourceUnreadable, "", "seek output for final verify failed", err)
+	}
+	h := sha256.New()
+	if _, err := copyWithContext(ctx, h, t.out); err != nil {
+		return "", newError(KindSourceUnreadable, "", "final hash read failed", err)
+	}
+	finalHash := hex.EncodeToString(h.Sum(nil))
+	if err := t.verifyCompletedOutput(ctx, cp); err != nil {
+		return "", err
+	}
+	for _, want := range t.states {
+		var src Source
+		for _, s := range t.sources {
+			if s.ID() == want.ID {
+				src = s
+			}
+		}
+		fp, err := src.Fingerprint(ctx)
+		if err != nil {
+			return "", err
+		}
+		if t.changedSources[want.ID] {
+			// 允许变化的来源：收尾不得再变（等于本次开始时），且大小必须稳定。
+			if fp != want.Fingerprint {
+				return "", newError(KindSourceChanged, want.ID,
+					fmt.Sprintf("source changed again during repair: start={size=%d hash=%s} end={size=%d hash=%s}",
+						want.Fingerprint.Size, want.Fingerprint.Hash, fp.Size, fp.Hash), nil)
+			}
+			continue
+		}
+		if fp != want.Fingerprint {
+			return "", newError(KindSourceChanged, want.ID,
+				fmt.Sprintf("source changed during task: start={size=%d hash=%s} end={size=%d hash=%s}",
+					want.Fingerprint.Size, want.Fingerprint.Hash, fp.Size, fp.Hash), nil)
+		}
+	}
+	return finalHash, nil
 }
 
 // Close 释放任务资源。

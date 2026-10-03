@@ -455,3 +455,69 @@ func waitUntil(cond func() bool, deadline time.Duration) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+func TestTask_BudgetSmallerThanShardFailsClearly(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a.bin"), 'A', 640)
+	specs := []SourceSpec{{ID: "a", Path: filepath.Join(dir, "a.bin"), Kind: RandomAccess, MaxConcurrency: 2}}
+	cfg := cfgFor(dir, specs, 64)
+	// 每片 64B，在途预算只给 10B：必须在有限时间内明确失败，而不是卡住。
+	cfg.Pipeline.InFlightBytes = 10
+	cfg.Pipeline.GlobalWorkers = 1
+	task, _ := NewTask(cfg)
+	done := make(chan error, 1)
+	go func() { done <- task.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if !kindIs(err, KindBudgetTooSmall) {
+			t.Fatalf("want KindBudgetTooSmall, got %#v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("task hung with a sub-shard budget")
+	}
+}
+
+func TestTask_BudgetExactlyShardSizeProducesSameResult(t *testing.T) {
+	dir := t.TempDir()
+	data := writeFile(t, filepath.Join(dir, "a.bin"), 'A', 640)
+	specs := []SourceSpec{{ID: "a", Path: filepath.Join(dir, "a.bin"), Kind: RandomAccess, MaxConcurrency: 2}}
+	cfg := cfgFor(dir, specs, 64)
+	// 最紧可用配置：单 worker + 预算恰好等于单片。必须正常完成且结果一致。
+	cfg.Pipeline.InFlightBytes = 64
+	cfg.Pipeline.GlobalWorkers = 1
+	task, _ := NewTask(cfg)
+	if err := task.Run(context.Background()); err != nil {
+		t.Fatalf("minimal feasible budget must complete: %v", err)
+	}
+	if !bytes.Equal(readFile(t, cfg.OutputPath), data) {
+		t.Fatal("result under tightest budget differs from full-budget run")
+	}
+}
+
+func TestTask_CompletedTaskTinyBudgetStillSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	data := writeFile(t, filepath.Join(dir, "a.bin"), 'A', 640)
+	specs := []SourceSpec{{ID: "a", Path: filepath.Join(dir, "a.bin"), Kind: RandomAccess, MaxConcurrency: 2}}
+	cfg := cfgFor(dir, specs, 64)
+	t1, _ := NewTask(cfg)
+	if err := t1.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// 全完成恢复：无需派发任何分片，预算多小都应在有限时间成功，结果不变。
+	cfg.Pipeline.InFlightBytes = 1
+	cfg.Pipeline.GlobalWorkers = 1
+	t2, _ := NewTask(cfg)
+	done := make(chan error, 1)
+	go func() { done <- t2.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("all-completed resume must succeed with tiny budget: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("all-completed resume hung with tiny budget")
+	}
+	if !bytes.Equal(readFile(t, cfg.OutputPath), data) {
+		t.Fatal("output changed")
+	}
+}

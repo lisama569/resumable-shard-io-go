@@ -158,6 +158,15 @@ func (p *Pipeline) Run(
 					fmt.Sprintf("shard %d size %d exceeds MaxShardBytes %d", sh.Index, size, p.cfg.MaxShardBytes), nil))
 				return
 			}
+			// 单片就超过在途字节预算：即使全局无其他在途分片也永远无法派发，
+			// 必须在有限时间内给出明确失败（KindBudgetTooSmall），而不是无限等待。
+			// done 分片不会被派发，故仅检查待处理分片。
+			if size > p.cfg.InFlightBytes {
+				fail(newError(KindBudgetTooSmall, sh.SourceID,
+					fmt.Sprintf("shard %d size %d exceeds InFlightBytes budget %d: raise InFlightBytes to at least the largest shard",
+						sh.Index, size, p.cfg.InFlightBytes), ErrBudgetTooSmall))
+				return
+			}
 
 			// 等待直到：单源并发有空额、在途字节有预算。
 			// collector 每按序回收一张分片，就通过 reclaim 通知一次。
@@ -224,7 +233,14 @@ func (p *Pipeline) Run(
 			select {
 			case wr = <-collected:
 			case <-ctx.Done():
-				collectErr = classifyCtxErr(ctx, ctx.Err())
+				// 若是 dispatcher 先明确失败（如预算过小）导致的内部 cancel，
+				// 采用其真实原因，避免误报成 canceled。
+				select {
+				case e := <-dispatchErr:
+					collectErr = e
+				default:
+					collectErr = classifyCtxErr(ctx, ctx.Err())
+				}
 				return
 			}
 			received++
@@ -263,7 +279,12 @@ func (p *Pipeline) Run(
 						slog.Int64("start", wr.res.Shard.Start), slog.Int64("end", wr.res.Shard.End),
 						slog.String("checksum", wr.res.Checksum))
 				case <-ctx.Done():
-					collectErr = classifyCtxErr(ctx, ctx.Err())
+					select {
+					case e := <-dispatchErr:
+						collectErr = e
+					default:
+						collectErr = classifyCtxErr(ctx, ctx.Err())
+					}
 					return
 				}
 				reclaim <- wr
@@ -289,6 +310,8 @@ func (p *Pipeline) Run(
 	default:
 		select {
 		case e := <-dispatchErr:
+			// dispatcher 明确失败（如预算过小）时其错误优先：它触发的内部 cancel
+			// 不应把真实原因掩盖成 KindCanceled。
 			retErr = e
 		default:
 			retErr = classifyCtxErr(parentCtx, parentCtx.Err())

@@ -22,6 +22,9 @@
 | `checkpoint_version` | `ErrCheckpointVersion` | 检查点版本不受支持 |
 | `checkpoint_mismatch` | `ErrCheckpointMismatch` | 与当前任务/来源/分片计划不匹配、完成记录冲突 |
 | `checksum_mismatch` | `ErrChecksumMismatch` | 恢复时回读输出摘要不符、最终输出大小/内容不符 |
+| `budget_too_small` | `ErrBudgetTooSmall` | 待处理分片比 `InFlightBytes` 还大，最小可行预算为最大分片长度 |
+| `source_layout_changed` | `ErrSourceLayoutChanged` | 来源数量/顺序/id/类型/大小变化，分片布局无法与检查点可靠对应，拒绝增量复用 |
+| `nothing_to_repair` | `ErrNothingToRepair` | 体检/修复时检查点不存在，没有可处理对象 |
 | `invalid_argument` | — | 配置非法、分片越界、顺序源非单调请求等 |
 
 > 三类检查点失败刻意分开：**文件坏了（corrupt）**、**版本不认识（version）**、
@@ -58,6 +61,11 @@
    确定性机制，不依赖时序“碰巧正确”。
 5. **恢复隔离**：输出文件被外部篡改时，先于继续读取触发 `checksum_mismatch`，
    阻止在损坏输出上叠加新数据。
+6. **体检只读**：`Inspect` 把输出损坏/截断（`output_missing` / `checksum_mismatch`）
+   与来源变化作为**报告内容**返回，而不是直接失败或修复；调用方据此决定是否修复。
+   修复（`Recover`）默认仍对来源变化保持严格拒绝（`checkpoint_mismatch`），只有显式
+   `AllowChangedSources` 且变化仅限同大小内容改写时才增量重算；任何改变分片布局的
+   变化返回 `source_layout_changed`。
 
 ## 4. 部分进度的去留
 
