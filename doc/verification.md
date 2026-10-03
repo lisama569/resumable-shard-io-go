@@ -4,10 +4,12 @@
 
 ```bash
 go version                      # 需要 Go 1.25+（在 Go 1.26 上开发并验证）
-go test ./...                   # 28 个测试
-go test -race -count=3 ./...    # 竞态检测下连跑 3 轮（约 11s）
+go test ./...                   # 41 个测试
+go test -race -count=3 ./...    # 竞态检测下连跑 3 轮（约 13s）
 go vet ./...
 go test -list '.*'              # 列出全部测试名
+go test -v -run 'TestDoctor' ./...   # 仅体检/修复/来源变化场景
+go test -v -run 'TestBudget' ./...   # 仅极小预算场景
 ```
 
 测试分三层：内存管线、检查点、真实磁盘任务集成。
@@ -26,7 +28,7 @@ go test -list '.*'              # 列出全部测试名
 | `TestPipeline_SkipCompletedShards` | 全完成计划一次读取都不触发（顺序源恢复等价） |
 | `TestPipeline_MixedSourcesInOneRun` | 随机 + 顺序两源在同一任务中协同、合并正确 |
 
-## 3. 检查点层（7 个）
+## 3. 检查点层（8 个）
 
 | 测试 | 覆盖路径 |
 | --- | --- |
@@ -39,7 +41,7 @@ go test -list '.*'              # 列出全部测试名
 | `TestCheckpoint_OutOfOrderCompletion` | 乱序完成可保存、可恢复 |
 | `TestCheckpoint_AtomicSaveLeavesNoTmp` | 多次原子保存不残留临时文件 |
 
-## 4. 任务集成层（真实磁盘，12 个）
+## 4. 任务集成层（真实磁盘，11 个，含 1 个参考等价用例）
 
 | 测试 | 覆盖路径 |
 | --- | --- |
@@ -56,14 +58,32 @@ go test -list '.*'              # 列出全部测试名
 | `TestTask_FailureIsolationOneSourceChanges` | 多源中仅一个变化：错误标识该源、不记 final_hash、不产混合版本 |
 | `TestMergeSerial_ReferenceEquivalence` | 管道输出、参考串行实现、最终哈希三者一致 |
 
-## 5. 确定性地模拟“运行中来源变化”
+## 5. 体检/修复与极小预算层（真实磁盘 + 内存管线，13 个）
+
+| 测试 | 覆盖路径 |
+| --- | --- |
+| `TestDoctor_ForceKill_ThenDiagnoseAndSelfHeal` | 强杀后输出坏两片：只读体检定位（且两文件逐字节不变）→ 修复只重做坏片 → 体检/修复重复执行稳定、好片不坏、终态哈希正确 |
+| `TestDoctor_OutputDeleted_FullRepairIdempotent` | 输出被删：全部判 `output_damaged`，全量重建 |
+| `TestDoctor_RepairReusesGoodShardsWithoutReReading` | 修复流水线读取计数证明好片不被重读（复用而非重做） |
+| `TestDoctor_SameSizePartialChange_IncrementalRerun` | 同大小部分改写：仅受影响片 `source_changed` 并重做，结果等于以新来源整体重跑，指纹推进 |
+| `TestDoctor_SourceSizeChange_RepairRejected` | 追加改大小：`indeterminable` → `repair_not_possible`，拒绝时两文件不变且可重复拒绝 |
+| `TestDoctor_MultiSource_OnlyAffectedSourceRedone` | 随机+顺序两源中仅一个同大小变化：只重做该源分片，顺序源全部复用 |
+| `TestDoctor_SequentialSource_SuffixRedo` | 顺序源早期片损坏：修复扩展为后缀重做，其他来源复用，重复修复幂等 |
+| `TestDoctor_PartialProgressKill_DamageRepairAndResume` | 部分进度强杀且含坏片：修复同时完成坏片重做与未完成片续跑 |
+| `TestDoctor_SameTaskInstanceRepeatedOpensAndClosesSources` | 同一 Task 实例连续多次体检/修复：来源与输出句柄重开不泄漏、互不干扰 |
+| `TestBudget_InFlightBelowOneShard_FailsFast` | 预算 < 单片：立即 `budget_too_small`，不死等、零读取、通道关闭 |
+| `TestBudget_ExactlyOneShard_CompletesSequentially` | 预算 = 单片、1 worker：串行完成、结果一致、在途峰值 ≤1 |
+| `TestBudget_TinyBudgetAllCompleted_IsIdempotent` | 极小预算下全完成恢复为空操作 |
+| `TestBudget_TaskRunWithSubShardBudget_FailsClearly` | 任务级极小预算给出可区分失败 |
+
+## 6. 确定性地模拟“运行中来源变化”
 
 直接“起任务后立刻改文件再取消”存在竞态（任务可能已经跑完，或取消先于变化）。
 测试改为注入一个 **stalling 来源**：前 N 次读取正常，之后在读之前阻塞；测试用
 `atomic` 计数等到确有分片阻塞（即确定存在未完成读取）后再改写文件、最后放行。
 于是读取前/后的身份复核必然命中来源变化。该构造在 `-race -count=3` 下稳定。
 
-## 6. 日志可观测性
+## 7. 日志可观测性
 
 默认使用 `slog`（测试用 `io.Discard` 静默）。排查时把级别调到 Debug：
 
@@ -81,9 +101,16 @@ cfg.Pipeline.Logger = logger
 - `backpressure: waiting for in-flight budget` / `waiting for source slot`
 - `shard confirmed ... range_start=.. range_end=.. basis=read+written+checkpointed`
 - `resume verify ok ... output_offset=.. checksum=..`
+- `doctor shard diagnosis ... status=ok|output_damaged|source_changed|indeterminable recorded=.. output_hash=.. current_hash=.. basis=..`
+- `doctor report ... ok=.. output_damaged=.. source_changed=.. indeterminable=.. repairable=.. changed_sources=.. basis="read-only..."`
+- `repair invalidating shard ... status=.. basis=..` / `repair redo-set expanded ... basis="sequential source..."`
+- `repair no-op ... basis="all completed shards diagnosed ok"`
+- `repair rejected ... basis=..`（无法界定影响范围时）
+- `repair completed redone=.. reused=.. redone_indexes=[..] final_sha256=.. basis="only diagnosed shards redone..."`
+- `pipeline rejected ... in_flight_limit=.. largest_pending_shard=.. basis="budget smaller than one pending shard..."`
 - `task completed ... final_sha256=.. basis=serial-equivalent merge verified`
 
-## 7. 手工冒烟
+## 8. 手工冒烟
 
 准备两个文件，用示例配置跑一次（应成功），`kill` 在中途后再跑一次（应从检查点
 恢复并成功），随后：

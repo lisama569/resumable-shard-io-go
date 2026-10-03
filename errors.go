@@ -18,6 +18,8 @@ const (
 	KindCheckpointMismatch ErrorKind = "checkpoint_mismatch"
 	KindChecksumMismatch   ErrorKind = "checksum_mismatch"
 	KindInvalidArgument    ErrorKind = "invalid_argument"
+	KindBudgetTooSmall     ErrorKind = "budget_too_small"
+	KindRepairNotPossible  ErrorKind = "repair_not_possible"
 )
 
 // Sentinel errors，供 errors.Is 使用。
@@ -28,6 +30,8 @@ var (
 	ErrCheckpointVersion  = errors.New("shardio: checkpoint version incompatible")
 	ErrCheckpointMismatch = errors.New("shardio: checkpoint does not match current sources")
 	ErrChecksumMismatch   = errors.New("shardio: checksum mismatch")
+	ErrBudgetTooSmall     = errors.New("shardio: in-flight byte budget smaller than any pending shard")
+	ErrRepairNotPossible  = errors.New("shardio: repair scope cannot be determined safely")
 )
 
 // Error 是带分类、来源标识与可解释依据的流水线错误。

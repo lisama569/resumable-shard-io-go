@@ -21,6 +21,16 @@
 - **两类本地来源协同**：`RandomAccess`（pread，可受限并发）与 `Sequential`
   （单调游标，单源串行）。
 - **干净取消**：取消/超时取消全部在途读取，无 goroutine 泄漏、无未完成处理。
+- **崩溃后只读体检（Doctor）**：`kill -9`/断电后，在**不改动输出与检查点**的
+  前提下，逐片比对“检查点记录 / 输出回读 / 当前来源重读”三方 SHA-256，报告
+  哪些已确认分片对不上（输出损坏 / 来源变化 / 无法界定）及判定依据。
+- **定向自愈（Repair）**：体检后**只重做有问题的分片**，好片不重读、不覆写，
+  最终结果与整体重跑逐字节一致；体检与修复均可重复执行且幂等。来源大小变化等
+  无法逐片证实安全边界的情况，修复**明确拒绝**（`repair_not_possible`），
+  绝不拼接新旧内容。
+- **极小预算确定行为**：在途字节预算小于任何待处理分片时，立即以
+  `budget_too_small` 失败（不死等、零读取）；预算不小于单片时正常完成，
+  结果与大预算一致且占用不超上限。
 
 ## 快速开始
 
@@ -44,17 +54,33 @@ if err := task.Run(ctx); err != nil {
 中断后用**完全相同**的 `TaskID / 输出路径 / 分片大小 / 来源集合`再次 `Run` 即从
 检查点恢复；来源发生任何变化都会得到 `KindCheckpointMismatch` 而非错误结果。
 
+进程被强制杀掉、怀疑输出或来源已被改动时，先用**只读体检**再决定是否修复：
+
+```go
+// 只读：不改动输出与检查点
+report, err := task.Doctor(ctx)
+// report.Shards[i].Status: ok / output_damaged / source_changed / indeterminable
+// report.Repairable=false 表示影响范围无法可靠界定，应整体重跑
+
+// 定向自愈：只重做报告中有问题的分片；无问题时是幂等空操作
+rreport, err := task.Repair(ctx)
+// rreport.Repaired / rreport.Reused 列出重做与复用的分片序号
+```
+
+详见 [doc/doctor-repair.md](doc/doctor-repair.md)。
+
 ## 深入文档
 
 - [doc/checkpoint.md](doc/checkpoint.md)：检查点文件格式、版本与兼容规则、恢复判定。
 - [doc/concurrency.md](doc/concurrency.md)：并发模型、单源上限、背压与内存上界、取消语义。
+- [doc/doctor-repair.md](doc/doctor-repair.md)：只读体检、定向修复、来源变化复用/拒绝边界、极小预算约定。
 - [doc/errors-and-isolation.md](doc/errors-and-isolation.md)：错误分类表、失败隔离策略。
 - [doc/verification.md](doc/verification.md)：本地验证方法（竞态、场景覆盖、日志）。
 
 ## 本地验证
 
 ```bash
-go test ./...                 # 功能 + 集成
+go test ./...                 # 功能 + 集成（41 个测试）
 go test -race -count=3 ./...  # 竞态检测下多轮稳定性
 go vet ./...
 ```

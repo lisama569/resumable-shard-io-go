@@ -163,6 +163,46 @@ func (s *SequentialFileSource) ReadShard(ctx context.Context, start, end int64) 
 	return buf, nil
 }
 
+// ReadShardAudit 在不推进顺序游标的前提下读取任意区间，仅供只读体检使用：
+// 底层走 pread（ReadAt），读到的字节与顺序读到的一致，且不会与恢复时的
+// ResumeAt/单调派发互相干扰。读取前后仍做身份复核，来源变化明确报错。
+func (s *SequentialFileSource) ReadShardAudit(ctx context.Context, start, end int64) ([]byte, error) {
+	if start < 0 || end < start {
+		return nil, newError(KindInvalidArgument, s.id,
+			fmt.Sprintf("bad range [%d,%d)", start, end), nil)
+	}
+	if err := s.verifyUnchanged(); err != nil {
+		return nil, err
+	}
+	n := end - start
+	buf := make([]byte, n)
+	if n == 0 {
+		return buf, nil
+	}
+	var off int64
+	for off < n {
+		if err := ctx.Err(); err != nil {
+			return nil, classifyCtxErr(ctx, err)
+		}
+		nr, err := s.file.ReadAt(buf[off:], start+off)
+		off += int64(nr)
+		if err != nil {
+			if os.IsPermission(err) {
+				return nil, newError(KindPermission, s.id, "read not permitted", err)
+			}
+			if changedErr := s.verifyUnchanged(); changedErr != nil {
+				return nil, changedErr
+			}
+			return nil, newError(KindSourceUnreadable, s.id,
+				fmt.Sprintf("audit read at %d failed after %d bytes", start+off, nr), err)
+		}
+	}
+	if err := s.verifyUnchanged(); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 // verifyUnchangedLocked 要求调用方持有 mu。
 func (s *SequentialFileSource) verifyUnchangedLocked() error {
 	base := s.base

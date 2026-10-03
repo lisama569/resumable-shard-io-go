@@ -23,6 +23,8 @@
 | `checkpoint_mismatch` | `ErrCheckpointMismatch` | 与当前任务/来源/分片计划不匹配、完成记录冲突 |
 | `checksum_mismatch` | `ErrChecksumMismatch` | 恢复时回读输出摘要不符、最终输出大小/内容不符 |
 | `invalid_argument` | — | 配置非法、分片越界、顺序源非单调请求等 |
+| `budget_too_small` | `ErrBudgetTooSmall` | 在途字节预算小于任何待处理分片，派发必然死等（预检在读取前快速失败） |
+| `repair_not_possible` | `ErrRepairNotPossible` | 体检发现影响范围无法逐片证实（如来源大小变化），修复拒绝拼接新旧内容 |
 
 > 三类检查点失败刻意分开：**文件坏了（corrupt）**、**版本不认识（version）**、
 > **文件完好但不是这份来源/任务的状态（mismatch）**，调用方可据此选择“删除重建”
@@ -58,6 +60,10 @@
    确定性机制，不依赖时序“碰巧正确”。
 5. **恢复隔离**：输出文件被外部篡改时，先于继续读取触发 `checksum_mismatch`，
    阻止在损坏输出上叠加新数据。
+6. **体检/修复隔离**：`Doctor` 是只读操作，只下结论不改动；`Repair` 对无法逐片
+   证实安全边界的情况（来源大小变化等）返回 `repair_not_possible` 且保持两文件
+   原样，宁可要求整体重跑也不产出“看起来成功”的拼接结果。详见
+   [doctor-repair.md](doctor-repair.md)。
 
 ## 4. 部分进度的去留
 

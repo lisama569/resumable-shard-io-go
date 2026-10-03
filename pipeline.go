@@ -78,6 +78,33 @@ func (p *Pipeline) Run(
 	defer cancel()
 	defer close(results)
 
+	// 预算预检：在途字节预算必须至少能容纳一张“待处理”分片。
+	// 否则 dispatcher 会停在该分片前永远等待（没有任何回收能腾出预算），
+	// 形成无法完成也无法失败的死等。已确认分片跳过、不占预算，故只看待处理分片；
+	// 这也保证“以极小预算重跑一个已全部完成的任务”是合法的幂等空操作。
+	var maxPending int64
+	for _, sh := range shards {
+		if done[sh.Index] {
+			continue
+		}
+		if size := sh.Length(); size > maxPending {
+			maxPending = size
+		}
+	}
+	if maxPending > p.cfg.InFlightBytes {
+		err := newError(KindBudgetTooSmall, "",
+			fmt.Sprintf("in-flight byte budget %d is smaller than the largest pending shard %d; "+
+				"raise InFlightBytes to at least %d (shard size=%d, global_workers=%d)",
+				p.cfg.InFlightBytes, maxPending, maxPending, shards[0].Length(), p.cfg.GlobalWorkers),
+			ErrBudgetTooSmall)
+		log.ErrorContext(ctx, "pipeline rejected",
+			slog.Int64("in_flight_limit", p.cfg.InFlightBytes),
+			slog.Int64("largest_pending_shard", maxPending),
+			slog.String("basis", "budget smaller than one pending shard would deadlock dispatch"),
+			slog.Any("error", err))
+		return err
+	}
+
 	pending := make(map[int]workerResult)
 	var inFlightBytes int64
 

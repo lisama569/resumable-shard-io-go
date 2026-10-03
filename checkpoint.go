@@ -248,6 +248,33 @@ func (c *Checkpoint) SnapshotCompleted() map[int]bool {
 	return out
 }
 
+// ForgetCompleted 撤销一个已确认分片的记录（修复时用于丢弃坏片）。
+// 撤销不存在的分片是幂等空操作；同时清空 final_hash，因为输出整体等价性
+// 已需要重新证明，旧终态哈希不得继续代表成品。
+func (c *Checkpoint) ForgetCompleted(index int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.Completed[index]; !ok {
+		return false
+	}
+	delete(c.Completed, index)
+	c.FinalHash = ""
+	return true
+}
+
+// UpdateSourceFingerprint 用当前指纹替换指定来源的快照（增量重算成功后使用）。
+func (c *Checkpoint) UpdateSourceFingerprint(id string, fp Fingerprint) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.Sources {
+		if c.Sources[i].ID == id {
+			c.Sources[i].Fingerprint = fp
+			return true
+		}
+	}
+	return false
+}
+
 // Marshal 序列化为带 magic/版本/摘要的封装格式。
 func (c *Checkpoint) Marshal() ([]byte, error) {
 	c.Version = checkpointVersion
